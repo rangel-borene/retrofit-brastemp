@@ -1,24 +1,10 @@
-menu "Example Configuration"
-
-    config RELAY_GPIO
-        int "Relay GPIO number"
-        range 0 48
-        default 4
-        help
-            GPIO number (IOxx) connected to the relay control pin.
-
-    config BUTTON_GPIO
-        int "Button GPIO number"
-        range 0 48
-        default 0
-        help
-            GPIO number (IOxx) connected to the button (with external or internal pull-up).
+menu "Button Configuration"
 
     config DEBOUNCE_MS
         int "Debounce time in ms"
         range 5 200
         default 20
         help
-            Debounce time in milliseconds for the button.
+            Debounce time in milliseconds for the button (GPIO 41).
 
 endmenu
