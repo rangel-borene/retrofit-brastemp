@@ -7,6 +7,7 @@
  */
 
 #include "preset_functions.h"
+#include "sdkconfig.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -218,17 +219,37 @@ static bool nivel_atingido(nivel_agua_t nivel_desejado)
  */
 static void verificar_abort(void)
 {
-    static uint8_t ultimo_nivel = 1; /* Pull-up, não pressionado = 1 */
+    static uint8_t ultimo_nivel = 1;      /* Pull-up, não pressionado = 1 */
+    static TickType_t tick_falling = 0;   /* Timestamp do falling edge */
+    static uint8_t debounce_pendente = 0; /* Flag: aguardando confirmação do debounce */
     uint8_t nivel_atual = gpio_get_level(GPIO_BOTAO_INICIAR);
 
-    /* Detecta falling edge: 1 → 0 (pressionou o botão) */
-    if (ultimo_nivel == 1 && nivel_atual == 0)
+    if (!debounce_pendente)
     {
-        vTaskDelay(pdMS_TO_TICKS(CONFIG_DEBOUNCE_MS));
-        if (gpio_get_level(GPIO_BOTAO_INICIAR) == 0)
+        /* Detecta falling edge: 1 → 0 (pressionou o botão) */
+        if (ultimo_nivel == 1 && nivel_atual == 0)
         {
-            ESP_LOGI(TAG, "ABORT detectado via GPIO (verificar_abort)!");
-            s_abort = true;
+            tick_falling = xTaskGetTickCount();
+            debounce_pendente = 1;
+        }
+    }
+    else
+    {
+        /* Período de debounce transcorrido? */
+        if ((xTaskGetTickCount() - tick_falling) >= pdMS_TO_TICKS(CONFIG_DEBOUNCE_MS))
+        {
+            /* Confirma se ainda está pressionado */
+            if (gpio_get_level(GPIO_BOTAO_INICIAR) == 0)
+            {
+                ESP_LOGI(TAG, "ABORT detectado via GPIO (verificar_abort)!");
+                s_abort = true;
+            }
+            debounce_pendente = 0;
+        }
+        else if (nivel_atual == 1)
+        {
+            /* Botão foi solto antes do fim do debounce — falso disparo */
+            debounce_pendente = 0;
         }
     }
 
@@ -443,6 +464,17 @@ void bater(uint32_t tempo_sec)
             return;
         }
 
+        // Verifica se a tampa foi aberta
+        if (gpio_get_level(GPIO_SENSOR_TAMPA) == 0)
+        {
+            ESP_LOGW(TAG, "Tampa aberta durante batimento! Desligando motor.");
+            gpio_set_level(GPIO_SSR_MESTRE, 0);
+            gpio_set_level(GPIO_MOTOR_HORARIO, 0);
+            gpio_set_level(GPIO_MOTOR_ANTI_H, 0);
+            ESP_LOGI(TAG, "<<< bater abortado por segurança");
+            return;
+        }
+
         // --- Sentido Horário (2.5s) ---
         // 1. Desliga SSR (corta corrente)
         gpio_set_level(GPIO_SSR_MESTRE, 0);
@@ -472,7 +504,7 @@ void bater(uint32_t tempo_sec)
         vTaskDelay(pdMS_TO_TICKS(2400));
     }
 
-    // --- Trata o resto (se houver), com verificação de abort ---
+    // --- Trata o resto (se houver), com verificação de abort e tampa ---
     if (resto > 0)
     {
         // Sempre inicia no sentido horário (mais seguro para a máquina)
@@ -485,7 +517,7 @@ void bater(uint32_t tempo_sec)
 
         gpio_set_level(GPIO_SSR_MESTRE, 1);
 
-        // Aciona o motor em steps de 100ms para permitir verificar abort
+        // Aciona o motor em steps de 100ms para permitir verificar abort e tampa
         uint32_t resto_ms = resto * 1000;
         uint32_t decorrido_ms = 0;
         while (decorrido_ms < resto_ms)
@@ -500,6 +532,18 @@ void bater(uint32_t tempo_sec)
                 ESP_LOGI(TAG, "<<< bater abortado");
                 return;
             }
+
+            // Verifica se a tampa foi aberta
+            if (gpio_get_level(GPIO_SENSOR_TAMPA) == 0)
+            {
+                ESP_LOGW(TAG, "Tampa aberta durante batimento (resto)! Desligando motor.");
+                gpio_set_level(GPIO_SSR_MESTRE, 0);
+                gpio_set_level(GPIO_MOTOR_HORARIO, 0);
+                gpio_set_level(GPIO_MOTOR_ANTI_H, 0);
+                ESP_LOGI(TAG, "<<< bater abortado por segurança");
+                return;
+            }
+
             vTaskDelay(pdMS_TO_TICKS(100));
             decorrido_ms += 100;
         }
@@ -566,15 +610,15 @@ void centrifugar(uint32_t tempo_sec)
         }
     }
 
-    // Desliga os relés primeiro
-    gpio_set_level(GPIO_MOTOR_HORARIO, 0);
-    gpio_set_level(GPIO_MOTOR_ANTI_H, 0);
+    // SSR desliga primeiro (corta corrente do motor)
+    gpio_set_level(GPIO_SSR_MESTRE, 0);
 
-    // Pequena pausa para garantir que os contatos abriram
+    // Pequena pausa para garantir que o SSR desligou
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // Depois desliga o SSR
-    gpio_set_level(GPIO_SSR_MESTRE, 0);
+    // Depois desliga os relés (sem corrente, sem arco elétrico)
+    gpio_set_level(GPIO_MOTOR_HORARIO, 0);
+    gpio_set_level(GPIO_MOTOR_ANTI_H, 0);
 
     // Aguarda o cesto desacelerar
     vTaskDelay(pdMS_TO_TICKS(2000));

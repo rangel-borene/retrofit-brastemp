@@ -88,8 +88,16 @@ static void finalizar_ciclo(bool abortado)
 {
     if (abortado)
     {
-        ESP_LOGI(TAG, "Ciclo abortado pelo usuário! Esvaziando tanque...");
-        esvaziar();
+        /* Só esvazia se houver água no tanque */
+        if (ler_pressao_adc_mv() > LIMIAR_TANQUE_VAZIO_MV)
+        {
+            ESP_LOGI(TAG, "Ciclo abortado pelo usuário! Esvaziando tanque...");
+            esvaziar();
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Ciclo abortado — tanque já vazio, pulando esvaziar()");
+        }
         limpar_abort();
     }
     else
