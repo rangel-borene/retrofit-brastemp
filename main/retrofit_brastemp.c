@@ -14,8 +14,12 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "preset_functions.h"
 
 static const char *TAG = "retrofit_brastemp";
+
+/* Sensor de pressão GPIO 4 - intervalo de impressão (ms) */
+#define PRINT_GPIO4_INTERVAL_MS 2000
 
 #define BUTTON_GPIO 41
 #define DEBOUNCE_MS CONFIG_DEBOUNCE_MS
@@ -24,6 +28,7 @@ static const char *TAG = "retrofit_brastemp";
 #define NVS_KEY_STATE "button_state"
 
 static uint8_t s_state = 0;             /* 0 = desligado, 1 = ligado */
+static uint8_t s_cycle_running = 0;     /* 1 = ciclo em andamento */
 static uint8_t s_last_button_state = 1; /* Pull-up, unpressed = 1 */
 static nvs_handle_t s_nvs_handle;
 
@@ -79,6 +84,86 @@ static esp_err_t init_nvs(void)
     return ESP_OK;
 }
 
+static void finalizar_ciclo(bool abortado)
+{
+    if (abortado)
+    {
+        ESP_LOGI(TAG, "Ciclo abortado pelo usuário! Esvaziando tanque...");
+        esvaziar();
+        limpar_abort();
+    }
+    else
+    {
+        ESP_LOGI(TAG, "Ciclo Edredon concluído");
+    }
+
+    /* Reconfigura os GPIOs dos presets ao final do ciclo */
+    configurar_gpios_preset();
+
+    /* Volta automaticamente para desligado */
+    s_state = 0;
+    ESP_LOGI(TAG, "desligado");
+
+    esp_err_t err = nvs_set_u8(s_nvs_handle, NVS_KEY_STATE, 0);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to save state: %s", esp_err_to_name(err));
+    }
+    else
+    {
+        err = nvs_commit(s_nvs_handle);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Failed to commit NVS: %s", esp_err_to_name(err));
+        }
+    }
+
+    s_cycle_running = 0;
+}
+
+static void executar_ciclo_edredon(void)
+{
+    ESP_LOGI(TAG, "Iniciando ciclo Edredon");
+
+    s_cycle_running = 1;
+
+    /* Etapa 1: Encher o tanque (200 ml de sabão para edredon) */
+    ESP_LOGI(TAG, "Enchendo tanque - água quente, 200 ml de sabão, nível máximo");
+    encher(AGUA_QUENTE, PRODUTO_1, 200, NIVEL_4);
+
+    if (obter_abort())
+    {
+        finalizar_ciclo(true);
+        return;
+    }
+
+    /* Etapa 2: Bater/agitar por 15 minutos */
+    ESP_LOGI(TAG, "Batendo roupa por 15 minutos...");
+    bater(900); /* 15 minutos = 900 segundos */
+
+    if (obter_abort())
+    {
+        finalizar_ciclo(true);
+        return;
+    }
+
+    /* Etapa 3: Esvaziar o tanque */
+    ESP_LOGI(TAG, "Esvaziando tanque...");
+    esvaziar();
+
+    if (obter_abort())
+    {
+        finalizar_ciclo(true);
+        return;
+    }
+
+    /* Etapa 4: Centrifugar por 5 minutos */
+    ESP_LOGI(TAG, "Centrifugando por 5 minutos...");
+    centrifugar(300); /* 5 minutos = 300 segundos */
+
+    finalizar_ciclo(obter_abort());
+}
+
 static void debounce_and_toggle(void)
 {
     uint8_t current_level = gpio_get_level(BUTTON_GPIO);
@@ -108,6 +193,19 @@ static void debounce_and_toggle(void)
                     ESP_LOGE(TAG, "Failed to commit NVS: %s", esp_err_to_name(err));
                 }
             }
+
+            /* Se está desligando e há ciclo em andamento, aborta */
+            if (s_state == 0 && s_cycle_running == 1)
+            {
+                ESP_LOGI(TAG, "Abortando ciclo em andamento...");
+                solicitar_abort();
+            }
+            /* Se ligou e não há ciclo em andamento, inicia o preset Edredon */
+            else if (s_state == 1 && s_cycle_running == 0)
+            {
+                limpar_abort();
+                executar_ciclo_edredon();
+            }
         }
     }
 
@@ -125,9 +223,24 @@ void app_main(void)
     /* Initialize NVS and restore state */
     init_nvs();
 
+    /* Initialize preset function GPIOs */
+    configurar_gpios_preset();
+
+    uint32_t last_print_tick = 0;
+
     while (1)
     {
         debounce_and_toggle();
+
+        /* Imprime o valor do GPIO 4 (sensor de pressão ADC) periodicamente */
+        uint32_t now = xTaskGetTickCount();
+        if ((now - last_print_tick) >= pdMS_TO_TICKS(PRINT_GPIO4_INTERVAL_MS))
+        {
+            uint32_t tensao_mv = ler_pressao_adc_mv();
+            ESP_LOGI(TAG, "GPIO4 (sensor pressao): %u mV", tensao_mv);
+            last_print_tick = now;
+        }
+
         vTaskDelay(pdMS_TO_TICKS(10)); /* Poll every 10ms */
     }
 }
