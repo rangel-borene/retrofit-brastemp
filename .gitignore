@@ -24,3 +24,5 @@ Thumbs.db
 # SDK config (user-specific)
 sdkconfig
 sdkconfig.old
+# AI assistant cache
+.continue/
