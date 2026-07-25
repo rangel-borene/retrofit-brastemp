@@ -76,6 +76,32 @@ extern "C"
      */
     void limpar_abort(void);
 
+    /**
+     * @brief Obtém o estado da flag de pausa.
+     *
+     * @return true se o ciclo está pausado.
+     */
+    bool obter_pausa(void);
+
+    /**
+     * @brief Pausa o ciclo em andamento.
+     *
+     * As funções de ciclo param de avançar enquanto a flag estiver setada.
+     */
+    void pausar(void);
+
+    /**
+     * @brief Continua o ciclo pausado.
+     */
+    void continuar(void);
+
+    /**
+     * @brief Limpa a flag de pausa.
+     *
+     * Deve ser chamada antes de iniciar um novo ciclo.
+     */
+    void limpar_pausa(void);
+
 /* ------------------------------------------------------------------ */
 /*  Constantes públicas                                               */
 /* ------------------------------------------------------------------ */
@@ -129,6 +155,23 @@ extern "C"
      * @brief Esvazia o tanque (aciona a bomba de drenagem).
      */
     void esvaziar(void);
+
+    /**
+     * @brief Acende ou apaga o LED indicador de ciclo em andamento (GPIO 21).
+     *
+     * @param ligar true para acender (ciclo rodando), false para apagar.
+     */
+    void led_ciclo_rodando(bool ligar);
+
+    /**
+     * @brief Acende ou apaga o LED indicador de pausa/alerta (GPIO 1).
+     *
+     * Acende quando o ciclo é pausado pelo usuário ou por condição de segurança
+     * (tampa aberta, timeout, desbalanceamento, etc.).
+     *
+     * @param ligar true para acender (pausado/alerta), false para apagar.
+     */
+    void led_pausa(bool ligar);
 
 #ifdef __cplusplus
 }

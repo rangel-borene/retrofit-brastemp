@@ -22,6 +22,7 @@ static const char *TAG = "retrofit_brastemp";
 #define PRINT_GPIO4_INTERVAL_MS 2000
 
 #define BUTTON_GPIO 41
+#define BUTTON_PAUSE_PLAY_GPIO 42
 #define DEBOUNCE_MS CONFIG_DEBOUNCE_MS
 
 #define NVS_NAMESPACE "storage"
@@ -37,6 +38,10 @@ static void configure_button(void)
     gpio_reset_pin(BUTTON_GPIO);
     gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
     gpio_set_pull_mode(BUTTON_GPIO, GPIO_PULLUP_ONLY);
+
+    gpio_reset_pin(BUTTON_PAUSE_PLAY_GPIO);
+    gpio_set_direction(BUTTON_PAUSE_PLAY_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BUTTON_PAUSE_PLAY_GPIO, GPIO_PULLUP_ONLY);
 }
 
 static esp_err_t init_nvs(void)
@@ -102,11 +107,13 @@ static void finalizar_ciclo(bool abortado)
     }
     else
     {
-        ESP_LOGI(TAG, "Ciclo Edredon concluído");
+        ESP_LOGI(TAG, "Ciclo Edredon concluido");
     }
 
-    /* Reconfigura os GPIOs dos presets ao final do ciclo */
-    configurar_gpios_preset();
+    /* Garante que os LEDs estejam apagados e a pausa limpa */
+    led_ciclo_rodando(false);
+    led_pausa(false);
+    limpar_pausa();
 
     /* Volta automaticamente para desligado */
     s_state = 0;
@@ -134,8 +141,11 @@ static void executar_ciclo_edredon(void)
     ESP_LOGI(TAG, "Iniciando ciclo Edredon");
 
     s_cycle_running = 1;
+    led_ciclo_rodando(true);
+    limpar_abort();
+    limpar_pausa();
 
-    /* Etapa 1: Encher o tanque (200 ml de sabão para edredon) */
+    /* Etapa 1: Encher o tanque (200 ml de sabao para edredon) */
     ESP_LOGI(TAG, "Enchendo tanque - água quente, 200 ml de sabão, nível máximo");
     encher(AGUA_QUENTE, PRODUTO_1, 200, NIVEL_4);
 
@@ -220,10 +230,60 @@ static void debounce_and_toggle(void)
     s_last_button_state = current_level;
 }
 
+/**
+ * @brief Task dedicada ao botão Pausar/Play.
+ *
+ * Roda em paralelo com app_main para permitir pausar/continuar mesmo
+ * quando o ciclo está bloqueando a task principal.
+ */
+static void task_pause_play(void *pvParameters)
+{
+    (void)pvParameters;
+    uint8_t last_level = 1;
+
+    while (1)
+    {
+        uint8_t current_level = gpio_get_level(BUTTON_PAUSE_PLAY_GPIO);
+
+        /* Detecta falling edge (pressionou) com pull-up: 1 -> 0 */
+        if (last_level == 1 && current_level == 0)
+        {
+            vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS));
+
+            if (gpio_get_level(BUTTON_PAUSE_PLAY_GPIO) == 0)
+            {
+                if (s_cycle_running)
+                {
+                    if (obter_pausa())
+                    {
+                        continuar();
+                        led_pausa(false);
+                        ESP_LOGI(TAG, "Ciclo continuado");
+                    }
+                    else
+                    {
+                        pausar();
+                        led_pausa(true);
+                        ESP_LOGI(TAG, "Ciclo pausado");
+                    }
+                }
+                else
+                {
+                    ESP_LOGW(TAG, "Botao Pausar/Play pressionado fora de um ciclo");
+                }
+            }
+        }
+
+        last_level = current_level;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "Retrofit Brastemp - Button Monitor");
-    ESP_LOGI(TAG, "Button GPIO: %d", BUTTON_GPIO);
+    ESP_LOGI(TAG, "Button Iniciar/Abortar GPIO: %d", BUTTON_GPIO);
+    ESP_LOGI(TAG, "Button Pausar/Play GPIO: %d", BUTTON_PAUSE_PLAY_GPIO);
     ESP_LOGI(TAG, "Debounce time: %d ms", DEBOUNCE_MS);
 
     configure_button();
@@ -236,16 +296,19 @@ void app_main(void)
 
     uint32_t last_print_tick = 0;
 
+    /* Cria task para monitorar botão Pausar/Play em paralelo */
+    xTaskCreate(task_pause_play, "pause_play", 2048, NULL, 5, NULL);
+
     while (1)
     {
         debounce_and_toggle();
 
-        /* Imprime o valor do GPIO 4 (sensor de pressão ADC) periodicamente */
+        /* Imprime o valor do GPIO 4 (sensor de pressao ADC) periodicamente */
         uint32_t now = xTaskGetTickCount();
         if ((now - last_print_tick) >= pdMS_TO_TICKS(PRINT_GPIO4_INTERVAL_MS))
         {
             uint32_t tensao_mv = ler_pressao_adc_mv();
-            ESP_LOGI(TAG, "GPIO4 (sensor pressao): %u mV", tensao_mv);
+            ESP_LOGI(TAG, "GPIO4 (sensor pressao): %" PRIu32 " mV", tensao_mv);
             last_print_tick = now;
         }
 
