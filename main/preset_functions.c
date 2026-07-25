@@ -98,9 +98,8 @@ static void aguardar_se_pausado(void)
 #define GPIO_BOTAO_INICIAR ((gpio_num_t)41)          /* Botão Iniciar/Abortar       [Digital] */
 #define GPIO_BOTAO_PAUSAR_PLAY ((gpio_num_t)42)      /* Botão Pausar/Play           [Digital] */
 
-/* Entradas digitais para teste em bancada (OR com sensor ADC) */
-#define GPIO_TEST_NIVEL_50 ((gpio_num_t)7)  /* Sinal digital: 50% do nivel atingido */
-#define GPIO_TEST_NIVEL_100 ((gpio_num_t)8) /* Sinal digital: 100% do nivel atingido */
+/* Entrada digital para teste em bancada: 1 clique = 50%, 2 cliques = 100% */
+#define GPIO_TEST_NIVEL ((gpio_num_t)8) /* Sinal digital: teste de nivel */
 
 /* LED dos botões (via relé 12V) */
 #define GPIO_LED_INICIAR ((gpio_num_t)21)   /* LED do Botão Iniciar/Abortar — HIGH = máquina operando */
@@ -121,7 +120,7 @@ static void aguardar_se_pausado(void)
 /* Bombas de produto químico */
 #define GPIO_BOMBA_CLARIFICANTE ((gpio_num_t)3)   /* Bomba Clarificante  */
 #define GPIO_BOMBA_NEUTRALIZANTE ((gpio_num_t)39) /* Bomba Neutralizante */
-#define GPIO_BOMBA_AMACIANTE ((gpio_num_t)46)     /* Bomba Amaciante     */
+#define GPIO_BOMBA_AMACIANTE ((gpio_num_t)7)      /* Bomba Amaciante     */
 
 /* ------------------------------------------------------------------ */
 /*  Constantes de calibração (ajustar manualmente)                    */
@@ -141,6 +140,9 @@ static void aguardar_se_pausado(void)
 #define NIVEL_2_MV 1650 // 50% do nível máximo
 #define NIVEL_3_MV 2475 // 75% do nível máximo
 #define NIVEL_4_MV 3300 // 100% do nível máximo
+
+/** @brief Tempo máximo entre cliques do teste de nível (ms) */
+#define TESTE_CLIQUE_TIMEOUT_MS 800
 
 /* ------------------------------------------------------------------ */
 /*  Helpers internos                                                   */
@@ -237,21 +239,91 @@ static uint32_t obter_limiar_nivel(nivel_agua_t nivel)
 }
 
 /**
- * @brief Retorna true se o sinal digital de teste de 50% (GPIO7) está ativo (HIGH).
+ * @brief Lê o estado do botão de teste de nível (GPIO8) e retorna qual
+ *        condição foi solicitada através de cliques.
+ *
+ * Lógica:
+ *   - 1 pulso (1 clique)   → retorna 50  (atingiu 50% do nível)
+ *   - 2 pulsos (2 cliques) → retorna 100 (atingiu 100% do nível)
+ *   - Nenhum pulso         → retorna 0   (sem sinal de teste)
+ *
+ * Deve ser chamada periodicamente (ex.: a cada 100 ms) para detectar
+ * bordas de subida e timeout entre cliques.
+ *
+ * @return 0, 50 ou 100.
+ */
+static int detectar_teste_nivel(void)
+{
+    static uint8_t ultimo_level = 0;            /* Último nível lido (pull-down = 0) */
+    static int contagem_cliques = 0;            /* Cliques detectados na janela atual */
+    static TickType_t tick_primeiro_clique = 0; /* Tick do primeiro clique */
+    static uint8_t aguardando_timeout = 0;      /* 1 = aguardando timeout entre cliques */
+    static int resultado_pendente = 0;          /* Resultado a ser retornado na próxima chamada */
+
+    /* Se há resultado pendente, retorna e limpa */
+    if (resultado_pendente != 0)
+    {
+        int ret = resultado_pendente;
+        resultado_pendente = 0;
+        return ret;
+    }
+
+    uint8_t level_atual = gpio_get_level(GPIO_TEST_NIVEL);
+
+    /* Detecta borda de subida: 0 → 1 (pressionou) */
+    if (ultimo_level == 0 && level_atual == 1)
+    {
+        contagem_cliques++;
+        if (contagem_cliques == 1)
+        {
+            tick_primeiro_clique = xTaskGetTickCount();
+        }
+        aguardando_timeout = 1;
+        ESP_LOGD(TAG, "Teste nivel: clique %d detectado", contagem_cliques);
+    }
+
+    /* Se está aguardando timeout, verifica se expirou */
+    if (aguardando_timeout && contagem_cliques > 0)
+    {
+        TickType_t agora = xTaskGetTickCount();
+        if ((agora - tick_primeiro_clique) >= pdMS_TO_TICKS(TESTE_CLIQUE_TIMEOUT_MS))
+        {
+            /* Timeout: processa a contagem */
+            if (contagem_cliques >= 2)
+            {
+                ESP_LOGI(TAG, "Teste nivel: 2 cliques -> 100%%");
+                resultado_pendente = 100;
+            }
+            else
+            {
+                ESP_LOGI(TAG, "Teste nivel: 1 clique -> 50%%");
+                resultado_pendente = 50;
+            }
+            contagem_cliques = 0;
+            aguardando_timeout = 0;
+        }
+    }
+
+    ultimo_level = level_atual;
+    return 0;
+}
+
+/**
+ * @brief Retorna true se o sinal de teste indicar 50% do nível.
  *        Usado em bancada para simular 50% do nível sem sensor de pressão.
  */
 static bool teste_nivel_50_atingido(void)
 {
-    return (gpio_get_level(GPIO_TEST_NIVEL_50) == 1);
+    return (detectar_teste_nivel() == 50);
 }
 
 /**
- * @brief Retorna true se o sinal digital de teste de 100% (GPIO8) está ativo (HIGH).
+ * @brief Retorna true se o sinal de teste indicar 100% do nível.
  *        Usado em bancada para simular 100% do nível sem sensor de pressão.
  */
 static bool teste_nivel_100_atingido(void)
 {
-    return (gpio_get_level(GPIO_TEST_NIVEL_100) == 1);
+    return (detectar_teste_nivel() == 100);
 }
 
 /**
@@ -475,17 +547,12 @@ void configurar_gpios_preset(void)
     gpio_set_direction(GPIO_BOTAO_PAUSAR_PLAY, GPIO_MODE_INPUT);
     gpio_set_pull_mode(GPIO_BOTAO_PAUSAR_PLAY, GPIO_PULLUP_ONLY);
 
-    /* --- ENTRADAS DE TESTE EM BANCADA --- */
+    /* --- ENTRADA DE TESTE EM BANCADA (GPIO8) --- */
 
-    /* Sinal digital: 50% do nivel (GPIO7) - pull-down, ativo em HIGH */
-    gpio_reset_pin(GPIO_TEST_NIVEL_50);
-    gpio_set_direction(GPIO_TEST_NIVEL_50, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(GPIO_TEST_NIVEL_50, GPIO_PULLDOWN_ONLY);
-
-    /* Sinal digital: 100% do nivel (GPIO8) - pull-down, ativo em HIGH */
-    gpio_reset_pin(GPIO_TEST_NIVEL_100);
-    gpio_set_direction(GPIO_TEST_NIVEL_100, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(GPIO_TEST_NIVEL_100, GPIO_PULLDOWN_ONLY);
+    /* 1 clique = 50%, 2 cliques = 100% */
+    gpio_reset_pin(GPIO_TEST_NIVEL);
+    gpio_set_direction(GPIO_TEST_NIVEL, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(GPIO_TEST_NIVEL, GPIO_PULLDOWN_ONLY);
 }
 
 void encher(agua_t agua, produto_quimico_t produto, uint16_t quantidade_ml, nivel_agua_t nivel)
@@ -511,7 +578,7 @@ void encher(agua_t agua, produto_quimico_t produto, uint16_t quantidade_ml, nive
     uint32_t limiar_alvo = obter_limiar_nivel(nivel);
     uint32_t limiar_metade = limiar_alvo / 2;
 
-    ESP_LOGI(TAG, "Aguardando 50%% do nivel (%" PRIu32 " mV) ou sinal digital GPIO7...", limiar_metade);
+    ESP_LOGI(TAG, "Aguardando 50%% do nivel (%" PRIu32 " mV) ou 1 clique no GPIO8...", limiar_metade);
     while (!(ler_tensao_adc() >= limiar_metade || teste_nivel_50_atingido()))
     {
         aguardar_se_pausado();
@@ -557,7 +624,7 @@ void encher(agua_t agua, produto_quimico_t produto, uint16_t quantidade_ml, nive
     case PRODUTO_4:
         /* PRODUTO_4 mapeado para a bomba amaciante (única disponível além das 3) */
         bomba_pin = GPIO_BOMBA_AMACIANTE;
-        ESP_LOGW(TAG, "PRODUTO_4 mapeado para bomba amaciante (GPIO 46)");
+        ESP_LOGW(TAG, "PRODUTO_4 mapeado para bomba amaciante (GPIO 7)");
         break;
     default:
         ESP_LOGW(TAG, "Produto quimico invalido: %d", (int)produto);
