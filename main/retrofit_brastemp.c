@@ -25,69 +25,10 @@ static const char *TAG = "retrofit_brastemp";
 #define BUTTON_PAUSE_PLAY_GPIO 42
 #define DEBOUNCE_MS CONFIG_DEBOUNCE_MS
 
-#define NVS_NAMESPACE "storage"
-#define NVS_KEY_STATE "button_state"
+#define GPIO_SENSOR_TAMPA ((gpio_num_t)5) /* Sensor de Tampa             [Digital] */
 
-static uint8_t s_state = 0;             /* 0 = desligado, 1 = ligado */
-static uint8_t s_cycle_running = 0;     /* 1 = ciclo em andamento */
-static uint8_t s_last_button_state = 1; /* Pull-up, unpressed = 1 */
-static nvs_handle_t s_nvs_handle;
-
-static void configure_button(void)
-{
-    gpio_reset_pin(BUTTON_GPIO);
-    gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(BUTTON_GPIO, GPIO_PULLUP_ONLY);
-
-    gpio_reset_pin(BUTTON_PAUSE_PLAY_GPIO);
-    gpio_set_direction(BUTTON_PAUSE_PLAY_GPIO, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(BUTTON_PAUSE_PLAY_GPIO, GPIO_PULLUP_ONLY);
-}
-
-static esp_err_t init_nvs(void)
-{
-    esp_err_t err;
-
-    /* Initialize NVS */
-    err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
-    {
-        /* NVS partition was truncated and needs to be erased */
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(err);
-
-    /* Open NVS handle */
-    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &s_nvs_handle);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Error (%s) opening NVS handle!", esp_err_to_name(err));
-        return err;
-    }
-
-    /* Read saved state */
-    uint8_t saved_state = 0;
-    err = nvs_get_u8(s_nvs_handle, NVS_KEY_STATE, &saved_state);
-    if (err == ESP_ERR_NVS_NOT_FOUND)
-    {
-        /* Key not found — write default (0 = desligado) */
-        ESP_LOGI(TAG, "No saved state found, defaulting to desligado");
-        err = nvs_set_u8(s_nvs_handle, NVS_KEY_STATE, 0);
-        ESP_ERROR_CHECK(err);
-        err = nvs_commit(s_nvs_handle);
-        ESP_ERROR_CHECK(err);
-        s_state = 0;
-    }
-    else
-    {
-        ESP_ERROR_CHECK(err);
-        s_state = saved_state;
-    }
-
-    ESP_LOGI(TAG, "Restored state: %s", s_state ? "ligado" : "desligado");
-    return ESP_OK;
-}
+static uint8_t s_cycle_running = 0; /* 1 = ciclo em andamento */
+static bool s_start = false;
 
 static void finalizar_ciclo(bool abortado)
 {
@@ -112,68 +53,62 @@ static void finalizar_ciclo(bool abortado)
 
     /* Garante que os LEDs estejam apagados e a pausa limpa */
     led_ciclo_rodando(false);
-    led_pausa(false);
-    limpar_pausa();
 
-    /* Volta automaticamente para desligado */
-    s_state = 0;
-    ESP_LOGI(TAG, "desligado");
-
-    esp_err_t err = nvs_set_u8(s_nvs_handle, NVS_KEY_STATE, 0);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to save state: %s", esp_err_to_name(err));
-    }
-    else
-    {
-        err = nvs_commit(s_nvs_handle);
-        if (err != ESP_OK)
-        {
-            ESP_LOGE(TAG, "Failed to commit NVS: %s", esp_err_to_name(err));
-        }
-    }
+    /* Fecha o dreno caso tenha sido aberto pela task_iniciar_abortar */
+    fechar_valvula_dreno();
 
     s_cycle_running = 0;
+}
+
+/**
+ * @brief Bloqueia até que a pausa seja liberada.
+ *
+ * A flag de pausa é alterada por outra task (task_pause_play /
+ * task_tampa_aberta), portanto a leitura via obter_pausa() precisa ser
+ * feita a cada iteração — uma variável local "bool pausado" ficaria
+ * obsoleta (stale) e causaria loop infinito.
+ */
+static void aguardar_pausa_liberada(void)
+{
+    while (obter_pausa())
+    {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 }
 
 static void executar_ciclo_edredon(void)
 {
     ESP_LOGI(TAG, "Iniciando ciclo Edredon");
 
+    /* Captura pontual do status (foto do instante) — use para decisões
+     * imediatas, NÃO para loops de espera. */
+    bool pausado = obter_pausa();
+    if (pausado)
+    {
+        ESP_LOGI(TAG, "Ciclo iniciado com pausa ja ativa");
+    }
+
     s_cycle_running = 1;
     led_ciclo_rodando(true);
-    limpar_abort();
-    limpar_pausa();
 
     /* Etapa 1: Encher o tanque (200 ml de sabao para edredon) */
     ESP_LOGI(TAG, "Enchendo tanque - água quente, 200 ml de sabão, nível máximo");
     encher(AGUA_QUENTE, PRODUTO_1, 200, NIVEL_4);
 
-    if (obter_abort())
-    {
-        finalizar_ciclo(true);
-        return;
-    }
+    /* Aguarda possível pausa ser liberada antes de prosseguir */
+    aguardar_pausa_liberada();
 
     /* Etapa 2: Bater/agitar por 15 minutos */
     ESP_LOGI(TAG, "Batendo roupa por 15 minutos...");
     bater(900); /* 15 minutos = 900 segundos */
 
-    if (obter_abort())
-    {
-        finalizar_ciclo(true);
-        return;
-    }
+    aguardar_pausa_liberada();
 
     /* Etapa 3: Esvaziar o tanque */
     ESP_LOGI(TAG, "Esvaziando tanque...");
     esvaziar();
 
-    if (obter_abort())
-    {
-        finalizar_ciclo(true);
-        return;
-    }
+    aguardar_pausa_liberada();
 
     /* Etapa 4: Centrifugar por 5 minutos */
     ESP_LOGI(TAG, "Centrifugando por 5 minutos...");
@@ -182,52 +117,123 @@ static void executar_ciclo_edredon(void)
     finalizar_ciclo(obter_abort());
 }
 
-static void debounce_and_toggle(void)
+/**
+ * @brief Task dedicada ao monitoramento da tampa.
+ *
+ *   - Quando a tampa ABRE (borda de descida 1→0): equivalente a pressionar o
+ *     botão pause.
+ *   - Quando a tampa FECHA (borda de subida 0→1): apenas informa via log que
+ *     o usuário deve clicar no botão Continue (pause/play) para prosseguir.
+ *
+ * A reativação do ciclo é feita exclusivamente pelo botão Pausar/Play (task_pause_play).
+ */
+static void task_tampa_aberta(void *pvParameters)
 {
-    uint8_t current_level = gpio_get_level(BUTTON_GPIO);
+    (void)pvParameters;
+    uint8_t last_level = 1; /* Pull-up: não pressionado = 1 (tampa fechada) */
 
-    /* Detects falling edge (press) with pull-up: 1 -> 0 */
-    if (s_last_button_state == 1 && current_level == 0)
+    while (1)
     {
-        /* Wait debounce time and check again */
-        vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS));
+        uint8_t current_level = gpio_get_level(GPIO_SENSOR_TAMPA);
 
-        if (gpio_get_level(BUTTON_GPIO) == 0)
+        /* Borda de descida: 1 → 0 (tampa ABRIU) */
+        if (last_level == 1 && current_level == 0)
         {
-            s_state = !s_state;
-            ESP_LOGI(TAG, "%s", s_state ? "ligado" : "desligado");
+            vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS));
 
-            /* Persist state to NVS */
-            esp_err_t err = nvs_set_u8(s_nvs_handle, NVS_KEY_STATE, s_state);
-            if (err != ESP_OK)
+            if (gpio_get_level(GPIO_SENSOR_TAMPA) == 0)
             {
-                ESP_LOGE(TAG, "Failed to save state: %s", esp_err_to_name(err));
-            }
-            else
-            {
-                err = nvs_commit(s_nvs_handle);
-                if (err != ESP_OK)
+                if (s_cycle_running)
                 {
-                    ESP_LOGE(TAG, "Failed to commit NVS: %s", esp_err_to_name(err));
+                    ESP_LOGW(TAG, "[SEGURANCA] Tampa aberta! Acionando pausar");
+                    pausar();
+                }
+                else
+                {
+                    ESP_LOGI(TAG, "[SEGURANCA] Tampa aberta. (fora de ciclo)");
                 }
             }
+        }
 
-            /* Se está desligando e há ciclo em andamento, aborta */
-            if (s_state == 0 && s_cycle_running == 1)
+        /* Borda de subida: 0 → 1 (tampa FECHOU) — apenas informa */
+        if (last_level == 0 && current_level == 1)
+        {
+            if (gpio_get_level(GPIO_SENSOR_TAMPA) == 1)
             {
-                ESP_LOGI(TAG, "Abortando ciclo em andamento...");
-                solicitar_abort();
-            }
-            /* Se ligou e não há ciclo em andamento, inicia o preset Edredon */
-            else if (s_state == 1 && s_cycle_running == 0)
-            {
-                limpar_abort();
-                executar_ciclo_edredon();
+                if (s_cycle_running && obter_pausa())
+                {
+                    ESP_LOGI(TAG, "[SEGURANCA] Tampa fechada. Clique no botao Continue para prosseguir.");
+                }
+                else
+                {
+                    ESP_LOGI(TAG, "[SEGURANCA] Tampa fechada. (fora de ciclo)");
+                }
             }
         }
-    }
 
-    s_last_button_state = current_level;
+        last_level = current_level;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+/**
+ * @brief Task dedicada ao botão Iniciar/Abortar.
+ *
+ * Substitui a antiga debounce_and_toggle() para GPIO 41.
+ * Funciona como a task_pause_play para o botão Iniciar/Abortar:
+ *
+ * - Se um ciclo está RODANDO e o botão é pressionado → ABORTA:
+ *      para o motor imediatamente, abre o dreno e seta a flag de abort.
+ *
+ * - Se NENHUM ciclo está rodando e o botão é pressionado → INICIA:
+ *      alimenta a flag iniciar() que o loop principal consome.
+ *
+ * Roda em paralelo para garantir resposta imediata mesmo se a main loop
+ * estiver bloqueada em operações longas (ex: encher, bater, centrifugar).
+ */
+static void task_iniciar_abortar(void *pvParameters)
+{
+    (void)pvParameters;
+    uint8_t last_level = 1; /* Pull-up: não pressionado = 1 */
+
+    while (1)
+    {
+        uint8_t current_level = gpio_get_level(BUTTON_GPIO);
+
+        /* Detecta falling edge (pressionou) com pull-up: 1 -> 0 */
+        if (last_level == 1 && current_level == 0)
+        {
+            vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS));
+
+            if (gpio_get_level(BUTTON_GPIO) == 0)
+            {
+                if (s_cycle_running)
+                {
+                    /* --- ABORT: ciclo em andamento --- */
+                    ESP_LOGW(TAG, "[ABORT] Botao Iniciar/Abortar pressionado durante ciclo!");
+
+                    /* Ação imediata de segurança: parar motor e abrir dreno */
+                    parar_motor_seguro();
+                    abrir_valvula_dreno();
+
+                    /* Seta a flag de abort para o ciclo */
+                    solicitar_abort();
+                }
+                else
+                {
+                    /* --- INICIAR: fora de ciclo --- */
+                    ESP_LOGI(TAG, "[INICIAR] Botao Iniciar/Abortar pressionado fora de ciclo.");
+
+                    /* Alimenta a flag que o loop principal consome */
+                    s_start = true;
+                }
+            }
+        }
+
+        /* Só aceita nova borda de descida quando o botão for solto */
+        last_level = current_level;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
 }
 
 /**
@@ -257,14 +263,10 @@ static void task_pause_play(void *pvParameters)
                     if (obter_pausa())
                     {
                         continuar();
-                        led_pausa(false);
-                        ESP_LOGI(TAG, "Ciclo continuado");
                     }
                     else
                     {
                         pausar();
-                        led_pausa(true);
-                        ESP_LOGI(TAG, "Ciclo pausado");
                     }
                 }
                 else
@@ -281,36 +283,51 @@ static void task_pause_play(void *pvParameters)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Retrofit Brastemp - Button Monitor");
+    ESP_LOGI(TAG, "Retrofit Brastemp - V 6.0");
     ESP_LOGI(TAG, "Button Iniciar/Abortar GPIO: %d", BUTTON_GPIO);
     ESP_LOGI(TAG, "Button Pausar/Play GPIO: %d", BUTTON_PAUSE_PLAY_GPIO);
     ESP_LOGI(TAG, "Debounce time: %d ms", DEBOUNCE_MS);
 
-    configure_button();
+    /* Configura os GPIOs dos botões (redundante com configurar_gpios_preset) */
+    gpio_reset_pin(BUTTON_GPIO);
+    gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BUTTON_GPIO, GPIO_PULLUP_ONLY);
 
-    /* Initialize NVS and restore state */
-    init_nvs();
+    gpio_reset_pin(BUTTON_PAUSE_PLAY_GPIO);
+    gpio_set_direction(BUTTON_PAUSE_PLAY_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BUTTON_PAUSE_PLAY_GPIO, GPIO_PULLUP_ONLY);
+
+    gpio_reset_pin(GPIO_SENSOR_TAMPA);
+    gpio_set_direction(GPIO_SENSOR_TAMPA, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(GPIO_SENSOR_TAMPA, GPIO_PULLUP_ONLY);
 
     /* Initialize preset function GPIOs */
     configurar_gpios_preset();
 
     uint32_t last_print_tick = 0;
 
-    /* Cria task para monitorar botão Pausar/Play em paralelo */
+    /* Cria tasks monitoras (em paralelo, sempre rodando) */
+    xTaskCreate(task_tampa_aberta, "tampa_aberta", 2048, NULL, 6, NULL);
+    xTaskCreate(task_iniciar_abortar, "iniciar_abortar", 2048, NULL, 5, NULL);
     xTaskCreate(task_pause_play, "pause_play", 2048, NULL, 5, NULL);
 
     while (1)
     {
-        debounce_and_toggle();
-
-        /* Imprime o valor do GPIO 4 (sensor de pressao ADC) periodicamente */
-        uint32_t now = xTaskGetTickCount();
-        if ((now - last_print_tick) >= pdMS_TO_TICKS(PRINT_GPIO4_INTERVAL_MS))
+        /* Verifica se o botão Iniciar foi pressionado (fora de ciclo) */
+        if (s_start && !s_cycle_running)
         {
-            uint32_t tensao_mv = ler_pressao_adc_mv();
-            ESP_LOGI(TAG, "GPIO4 (sensor pressao): %" PRIu32 " mV", tensao_mv);
-            last_print_tick = now;
+            s_start = false;
+            executar_ciclo_edredon();
         }
+
+        // /* Imprime o valor do GPIO 4 (sensor de pressao ADC) periodicamente */
+        // uint32_t now = xTaskGetTickCount();
+        // if ((now - last_print_tick) >= pdMS_TO_TICKS(PRINT_GPIO4_INTERVAL_MS))
+        // {
+        //     uint32_t tensao_mv = ler_pressao_adc_mv();
+        //     ESP_LOGI(TAG, "GPIO4 (sensor pressao): %" PRIu32 " mV", tensao_mv);
+        //     last_print_tick = now;
+        // }
 
         vTaskDelay(pdMS_TO_TICKS(10)); /* Poll every 10ms */
     }

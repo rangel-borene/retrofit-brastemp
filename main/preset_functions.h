@@ -44,10 +44,10 @@ extern "C"
     typedef enum
     {
         PRODUTO_NENHUM = 0,
-        PRODUTO_1 = 1,
-        PRODUTO_2 = 2,
-        PRODUTO_3 = 3,
-        PRODUTO_4 = 4,
+        PRODUTO_1 = 1, /**< Detergente    (GPIO 16) */
+        PRODUTO_2 = 2, /**< Clarificante  (GPIO 10) */
+        PRODUTO_3 = 3, /**< Neutralizante (GPIO 39) */
+        PRODUTO_4 = 4, /**< Essência      (GPIO 7)  */
     } produto_quimico_t;
 
     /* ------------------------------------------------------------------ */
@@ -130,7 +130,9 @@ extern "C"
      * @brief Enche o tanque com os parâmetros especificados.
      *
      * @param agua             Água fria (AGUA_FRIA) ou quente (AGUA_QUENTE).
-     * @param produto          Tipo de produto químico (PRODUTO_1 a PRODUTO_4).
+     * @param produto          Tipo de produto químico (PRODUTO_1 a PRODUTO_4):
+     *                         PRODUTO_1 = detergente, PRODUTO_2 = clarificante,
+     *                         PRODUTO_3 = neutralizante, PRODUTO_4 = essência.
      * @param quantidade_ml    Volume do produto químico em mililitros (ml).
      *                         Bomba peristáltica de 400 ml/min, tempo = ml * 150 ms.
      * @param nivel            Nível de água (NIVEL_1 a NIVEL_4).
@@ -172,6 +174,31 @@ extern "C"
      * @param ligar true para acender (pausado/alerta), false para apagar.
      */
     void led_pausa(bool ligar);
+
+    /**
+     * @brief Para o motor de forma segura.
+     *
+     * Desliga o SSR mestre primeiro, depois os relés de direção,
+     * com pausas para evitar curto-circuito entre relés.
+     *
+     * Pode ser chamada por tasks de segurança externas (ex: monitor da tampa).
+     */
+    void parar_motor_seguro(void);
+
+    /**
+     * @brief Abre a válvula/dreno da bomba de drenagem (GPIO 9).
+     *
+     * Função não-bloqueante de segurança para iniciar o esvaziamento
+     * imediatamente. Pode ser chamada por tasks externas (ex: task_iniciar_abortar).
+     */
+    void abrir_valvula_dreno(void);
+
+    /**
+     * @brief Fecha a válvula/dreno da bomba de drenagem.
+     *
+     * Desliga o GPIO da bomba de drenagem.
+     */
+    void fechar_valvula_dreno(void);
 
 #ifdef __cplusplus
 }

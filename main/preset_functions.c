@@ -21,6 +21,12 @@
 static const char *TAG = "preset_functions";
 
 /* ------------------------------------------------------------------ */
+/*  Flag de iniciar compartilhada                                     */
+/* ------------------------------------------------------------------ */
+
+static volatile bool s_iniciar = false;
+
+/* ------------------------------------------------------------------ */
 /*  Flag de abort compartilhada                                        */
 /* ------------------------------------------------------------------ */
 
@@ -33,7 +39,7 @@ bool obter_abort(void)
 
 void solicitar_abort(void)
 {
-    ESP_LOGI(TAG, "ABORT solicitado!");
+    ESP_LOGI(TAG, "ABORT solicitado");
     s_abort = true;
 }
 
@@ -57,30 +63,19 @@ void pausar(void)
 {
     ESP_LOGI(TAG, "PAUSA solicitada");
     s_pausa = true;
+    led_pausa(true);
 }
 
 void continuar(void)
 {
     ESP_LOGI(TAG, "CONTINUAR solicitado");
     s_pausa = false;
+    led_pausa(false);
 }
 
 void limpar_pausa(void)
 {
     s_pausa = false;
-}
-
-/**
- * @brief Trava a execução enquanto a flag de pausa estiver ativa.
- *        As funções de ciclo devem chamar este helper nos loops de espera.
- */
-static void aguardar_se_pausado(void)
-{
-    while (s_pausa)
-    {
-        /* Permite que o watchdog não dispare e mantém a resposta ao botão */
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -118,9 +113,10 @@ static void aguardar_se_pausado(void)
 #define GPIO_BOMBA_DREENO ((gpio_num_t)9) /* Bomba de Drenagem */
 
 /* Bombas de produto químico */
-#define GPIO_BOMBA_CLARIFICANTE ((gpio_num_t)3)   /* Bomba Clarificante  */
-#define GPIO_BOMBA_NEUTRALIZANTE ((gpio_num_t)39) /* Bomba Neutralizante */
-#define GPIO_BOMBA_AMACIANTE ((gpio_num_t)7)      /* Bomba Amaciante     */
+#define GPIO_BOMBA_DETERGENTE ((gpio_num_t)16)    /* Bomba Detergente    (PRODUTO_1) - GPIO seguro */
+#define GPIO_BOMBA_CLARIFICANTE ((gpio_num_t)10)  /* Bomba Clarificante  (PRODUTO_2) - GPIO seguro (GPIO 3 e strapping pin, evitado) */
+#define GPIO_BOMBA_NEUTRALIZANTE ((gpio_num_t)39) /* Bomba Neutralizante (PRODUTO_3) */
+#define GPIO_BOMBA_ESSENCIA ((gpio_num_t)7)       /* Bomba Essência      (PRODUTO_4) */
 
 /* ------------------------------------------------------------------ */
 /*  Constantes de calibração (ajustar manualmente)                    */
@@ -254,7 +250,7 @@ static uint32_t obter_limiar_nivel(nivel_agua_t nivel)
  */
 static int detectar_teste_nivel(void)
 {
-    static uint8_t ultimo_level = 0;            /* Último nível lido (pull-down = 0) */
+    static uint8_t ultimo_level = 1;            /* Último nível lido (pull-up = 1) */
     static int contagem_cliques = 0;            /* Cliques detectados na janela atual */
     static TickType_t tick_primeiro_clique = 0; /* Tick do primeiro clique */
     static uint8_t aguardando_timeout = 0;      /* 1 = aguardando timeout entre cliques */
@@ -270,8 +266,8 @@ static int detectar_teste_nivel(void)
 
     uint8_t level_atual = gpio_get_level(GPIO_TEST_NIVEL);
 
-    /* Detecta borda de subida: 0 → 1 (pressionou) */
-    if (ultimo_level == 0 && level_atual == 1)
+    /* Detecta borda de descida: 1 → 0 (pressionou → GND) */
+    if (ultimo_level == 1 && level_atual == 0)
     {
         contagem_cliques++;
         if (contagem_cliques == 1)
@@ -378,7 +374,7 @@ static bool tanque_vazio_com_histerese(bool *ultimo_estado_vazio)
 /**
  * @brief Para o motor de forma segura: SSR primeiro, depois relés.
  */
-static void parar_motor_seguro(void)
+void parar_motor_seguro(void)
 {
     gpio_set_level(GPIO_SSR_MESTRE, 0);
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -388,71 +384,11 @@ static void parar_motor_seguro(void)
 }
 
 /**
- * @brief Retorna true se a tampa está aberta.
- *        Considera pull-up: 0 = tampa aberta (depende do sensor).
- */
-static bool tampa_aberta(void)
-{
-    return (gpio_get_level(GPIO_SENSOR_TAMPA) == 0);
-}
-
-/**
  * @brief Retorna true se desbalanceamento foi detectado.
  */
 static bool desbalanceamento_detectado(void)
 {
     return (gpio_get_level(GPIO_SENSOR_DESBALANCEAMENTO) == 0);
-}
-
-/* ------------------------------------------------------------------ */
-/*  Verificação de abort (lê GPIO diretamente nos ciclos longos)      */
-/* ------------------------------------------------------------------ */
-
-/**
- * @brief Lê o GPIO do botão (GPIO_BOTAO_INICIAR = 41) com debounce
- *        e seta s_abort = true se detectar falling edge (1 → 0).
- *
- * Deve ser chamada dentro dos loops de espera das funções de ciclo
- * (encher, bater, centrifugar, esvaziar) para permitir abort mesmo
- * quando o loop principal está bloqueado.
- */
-static void verificar_abort(void)
-{
-    static uint8_t ultimo_nivel = 1;      /* Pull-up, não pressionado = 1 */
-    static TickType_t tick_falling = 0;   /* Timestamp do falling edge */
-    static uint8_t debounce_pendente = 0; /* Flag: aguardando confirmação do debounce */
-    uint8_t nivel_atual = gpio_get_level(GPIO_BOTAO_INICIAR);
-
-    if (!debounce_pendente)
-    {
-        /* Detecta falling edge: 1 → 0 (pressionou o botão) */
-        if (ultimo_nivel == 1 && nivel_atual == 0)
-        {
-            tick_falling = xTaskGetTickCount();
-            debounce_pendente = 1;
-        }
-    }
-    else
-    {
-        /* Período de debounce transcorrido? */
-        if ((xTaskGetTickCount() - tick_falling) >= pdMS_TO_TICKS(CONFIG_DEBOUNCE_MS))
-        {
-            /* Confirma se ainda está pressionado */
-            if (gpio_get_level(GPIO_BOTAO_INICIAR) == 0)
-            {
-                ESP_LOGI(TAG, "ABORT detectado via GPIO (verificar_abort)!");
-                s_abort = true;
-            }
-            debounce_pendente = 0;
-        }
-        else if (nivel_atual == 1)
-        {
-            /* Botão foi solto antes do fim do debounce — falso disparo */
-            debounce_pendente = 0;
-        }
-    }
-
-    ultimo_nivel = nivel_atual;
 }
 
 /* ------------------------------------------------------------------ */
@@ -479,11 +415,12 @@ void configurar_gpios_preset(void)
 
     /* Bombas de produto químico */
     const gpio_num_t bombas[] = {
+        GPIO_BOMBA_DETERGENTE,
         GPIO_BOMBA_CLARIFICANTE,
         GPIO_BOMBA_NEUTRALIZANTE,
-        GPIO_BOMBA_AMACIANTE,
+        GPIO_BOMBA_ESSENCIA,
     };
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < (sizeof(bombas) / sizeof(bombas[0])); i++)
     {
         gpio_reset_pin(bombas[i]);
         gpio_set_direction(bombas[i], GPIO_MODE_OUTPUT);
@@ -552,7 +489,7 @@ void configurar_gpios_preset(void)
     /* 1 clique = 50%, 2 cliques = 100% */
     gpio_reset_pin(GPIO_TEST_NIVEL);
     gpio_set_direction(GPIO_TEST_NIVEL, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(GPIO_TEST_NIVEL, GPIO_PULLDOWN_ONLY);
+    gpio_set_pull_mode(GPIO_TEST_NIVEL, GPIO_PULLUP_ONLY);
 }
 
 void encher(agua_t agua, produto_quimico_t produto, uint16_t quantidade_ml, nivel_agua_t nivel)
@@ -560,14 +497,6 @@ void encher(agua_t agua, produto_quimico_t produto, uint16_t quantidade_ml, nive
     ESP_LOGI(TAG, ">>> encher(agua=%s, produto=%d, quantidade_ml=%u, nivel=%d)",
              agua == AGUA_QUENTE ? "QUENTE" : "FRIA",
              (int)produto, quantidade_ml, (int)nivel);
-
-    /* Verifica segurança antes de começar */
-    if (tampa_aberta())
-    {
-        ESP_LOGW(TAG, "Tampa aberta! Nao e possivel encher.");
-        led_pausa(true);
-        return;
-    }
 
     /* --- 1. Abre a válvula de água --- */
     gpio_num_t valvula_pin = (agua == AGUA_QUENTE) ? GPIO_VALVULA_AGUA_QUENTE
@@ -579,32 +508,35 @@ void encher(agua_t agua, produto_quimico_t produto, uint16_t quantidade_ml, nive
     uint32_t limiar_metade = limiar_alvo / 2;
 
     ESP_LOGI(TAG, "Aguardando 50%% do nivel (%" PRIu32 " mV) ou 1 clique no GPIO8...", limiar_metade);
+
+    bool pausado = false;
     while (!(ler_tensao_adc() >= limiar_metade || teste_nivel_50_atingido()))
     {
-        aguardar_se_pausado();
-        verificar_abort();
-        if (s_abort)
-        {
-            ESP_LOGW(TAG, "ABORT durante espera de nivel! Fechando valvula.");
-            gpio_set_level(valvula_pin, 0);
-            ESP_LOGI(TAG, "<<< encher abortado");
-            return;
-        }
 
-        if (tampa_aberta())
+        bool pausa_atual = obter_pausa();
+
+        /* Detecta mudança no status de pausa (a flag é alterada por outra task) */
+        if (pausa_atual != pausado)
         {
-            ESP_LOGW(TAG, "Tampa aberta durante enchimento! Fechando valvula.");
-            gpio_set_level(valvula_pin, 0);
-            led_pausa(true);
-            ESP_LOGI(TAG, "<<< encher abortado por seguranca");
-            return;
+            pausado = pausa_atual;
+
+            if (pausado)
+            {
+                gpio_set_level(valvula_pin, 0);
+                ESP_LOGI(TAG, "PAUSA: valvula desligada");
+            }
+            else
+            {
+                gpio_set_level(valvula_pin, 1);
+                ESP_LOGI(TAG, "CONTINUAR: valvula religada");
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
     /* --- 3. Dosagem do produto químico --- */
-    gpio_num_t bomba_pin = GPIO_NUM_NC; /* Inicializa com valor seguro (Not Connected) */
+    gpio_num_t bomba_pin = GPIO_NUM_NC;
     uint8_t produto_valido = 1;
     switch (produto)
     {
@@ -613,18 +545,16 @@ void encher(agua_t agua, produto_quimico_t produto, uint16_t quantidade_ml, nive
         produto_valido = 0;
         break;
     case PRODUTO_1:
-        bomba_pin = GPIO_BOMBA_CLARIFICANTE;
+        bomba_pin = GPIO_BOMBA_DETERGENTE;
         break;
     case PRODUTO_2:
-        bomba_pin = GPIO_BOMBA_NEUTRALIZANTE;
+        bomba_pin = GPIO_BOMBA_CLARIFICANTE;
         break;
     case PRODUTO_3:
-        bomba_pin = GPIO_BOMBA_AMACIANTE;
+        bomba_pin = GPIO_BOMBA_NEUTRALIZANTE;
         break;
     case PRODUTO_4:
-        /* PRODUTO_4 mapeado para a bomba amaciante (única disponível além das 3) */
-        bomba_pin = GPIO_BOMBA_AMACIANTE;
-        ESP_LOGW(TAG, "PRODUTO_4 mapeado para bomba amaciante (GPIO 7)");
+        bomba_pin = GPIO_BOMBA_ESSENCIA;
         break;
     default:
         ESP_LOGW(TAG, "Produto quimico invalido: %d", (int)produto);
@@ -639,92 +569,85 @@ void encher(agua_t agua, produto_quimico_t produto, uint16_t quantidade_ml, nive
 
         gpio_set_level(bomba_pin, 1);
 
-        /* Dosagem em passos de 100 ms permitindo abort/tampa */
         uint32_t decorrido_ms = 0;
         while (decorrido_ms < tempo_bomba_ms)
         {
-            aguardar_se_pausado();
-            verificar_abort();
-            if (s_abort)
+
+            bool pausa_atual = obter_pausa();
+
+            /* Só liga/desliga a bomba quando o status de pausa MUDA */
+            if (pausa_atual != pausado)
             {
-                ESP_LOGW(TAG, "ABORT durante dosagem! Desligando bomba.");
-                gpio_set_level(bomba_pin, 0);
-                gpio_set_level(valvula_pin, 0);
-                ESP_LOGI(TAG, "<<< encher abortado");
-                return;
+                pausado = pausa_atual;
+
+                if (pausado)
+                {
+                    gpio_set_level(bomba_pin, 0);
+                    ESP_LOGI(TAG, "PAUSA: dosadora desligada");
+                }
+                else
+                {
+                    gpio_set_level(bomba_pin, 1);
+                    ESP_LOGI(TAG, "CONTINUAR: dosadora religada");
+                }
             }
 
-            if (tampa_aberta())
+            if (!pausado)
             {
-                ESP_LOGW(TAG, "Tampa aberta durante dosagem! Desligando bomba.");
-                gpio_set_level(bomba_pin, 0);
-                gpio_set_level(valvula_pin, 0);
-                led_pausa(true);
-                ESP_LOGI(TAG, "<<< encher abortado por seguranca");
-                return;
+                uint32_t passo = 100;
+                if (passo > (tempo_bomba_ms - decorrido_ms))
+                {
+                    passo = tempo_bomba_ms - decorrido_ms;
+                }
+                decorrido_ms += passo;
+                vTaskDelay(pdMS_TO_TICKS(passo));
             }
-
-            uint32_t passo = 100;
-            if (passo > (tempo_bomba_ms - decorrido_ms))
+            else
             {
-                passo = tempo_bomba_ms - decorrido_ms;
+                /* Pausado: apenas aguarda e re-checa a flag */
+                vTaskDelay(pdMS_TO_TICKS(100));
             }
-            vTaskDelay(pdMS_TO_TICKS(passo));
-            decorrido_ms += passo;
         }
 
         gpio_set_level(bomba_pin, 0);
     }
 
-    /* --- 4. Enche até o nível final (com timeout) --- */
+    /* --- 4. Enche até o nível final --- */
     ESP_LOGI(TAG, "Enchendo tanque ate nivel %d...", (int)nivel);
-    const uint32_t TIMEOUT_MS = 60000; /* 60 segundos */
-    const uint32_t TICK_TIMEOUT = pdMS_TO_TICKS(TIMEOUT_MS);
-    TickType_t inicio = xTaskGetTickCount();
 
     while (!nivel_atingido(nivel))
     {
-        aguardar_se_pausado();
-        if ((xTaskGetTickCount() - inicio) >= TICK_TIMEOUT)
-        {
-            ESP_LOGW(TAG, "TIMEOUT: Nivel nao atingido! Fechando valvula.");
-            gpio_set_level(valvula_pin, 0);
-            led_pausa(true);
-            ESP_LOGI(TAG, "<<< encher abortado por timeout");
-            return;
-        }
 
-        verificar_abort();
-        if (s_abort)
-        {
-            ESP_LOGW(TAG, "ABORT durante encher! Fechando valvula.");
-            gpio_set_level(valvula_pin, 0);
-            ESP_LOGI(TAG, "<<< encher abortado");
-            return;
-        }
+        bool pausa_atual = obter_pausa();
 
-        if (tampa_aberta())
+        /* Detecta mudança no status de pausa (a flag é alterada por outra task) */
+        if (pausa_atual != pausado)
         {
-            ESP_LOGW(TAG, "Tampa aberta durante encher! Fechando valvula.");
-            gpio_set_level(valvula_pin, 0);
-            led_pausa(true);
-            ESP_LOGI(TAG, "<<< encher abortado por seguranca");
-            return;
+            pausado = pausa_atual;
+
+            if (pausado)
+            {
+                gpio_set_level(valvula_pin, 0);
+                ESP_LOGI(TAG, "PAUSA: valvula desligada");
+            }
+            else
+            {
+                gpio_set_level(valvula_pin, 1);
+                ESP_LOGI(TAG, "CONTINUAR: valvula religada");
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-    /* --- 5. Fecha a válvula --- */
     gpio_set_level(valvula_pin, 0);
     ESP_LOGI(TAG, "<<< encher concluido");
 }
 
-/* Constantes de timing para bater(). Cada ciclo completo (H + AH) dura 5 s. */
-#define BATIDA_TEMPO_GIRO_MS 2200                                                                               /* Tempo de giro em cada sentido */
-#define BATIDA_TEMPO_PARADA_MS 200                                                                              /* Pausa para o motor parar antes de inverter */
-#define BATIDA_TEMPO_DEBOUNCE_RELE_MS 100                                                                       /* Aguarda contatos dos relés estabilizarem */
-#define BATIDA_TEMPO_SENTIDO_MS (BATIDA_TEMPO_GIRO_MS + BATIDA_TEMPO_PARADA_MS + BATIDA_TEMPO_DEBOUNCE_RELE_MS) /* 2500 ms */
+#define BATIDA_TEMPO_GIRO_MS 2200
+#define BATIDA_TEMPO_PARADA_MS 200
+#define BATIDA_TEMPO_DEBOUNCE_RELE_MS 100
+#define BATIDA_TEMPO_SENTIDO_MS (BATIDA_TEMPO_GIRO_MS + BATIDA_TEMPO_PARADA_MS + BATIDA_TEMPO_DEBOUNCE_RELE_MS)
 
 void bater(uint32_t tempo_sec)
 {
@@ -736,69 +659,67 @@ void bater(uint32_t tempo_sec)
         return;
     }
 
-    if (tampa_aberta())
-    {
-        ESP_LOGW(TAG, "Tampa aberta! Nao e possivel bater.");
-        led_pausa(true);
-        return;
-    }
-
     uint32_t tempo_total_ms = tempo_sec * 1000;
     uint32_t decorrido_ms = 0;
     uint32_t ms_no_sentido = 0;
-    bool sentido_horario = true;
 
-    /* Configura relés para horário e liga SSR */
-    gpio_set_level(GPIO_SSR_MESTRE, 0);
-    gpio_set_level(GPIO_MOTOR_HORARIO, 1);
-    gpio_set_level(GPIO_MOTOR_ANTI_H, 0);
-    vTaskDelay(pdMS_TO_TICKS(BATIDA_TEMPO_DEBOUNCE_RELE_MS));
-    gpio_set_level(GPIO_SSR_MESTRE, 1);
+    bool sentido_horario = false;
 
+    bool pausado = false;
     while (decorrido_ms < tempo_total_ms)
     {
-        aguardar_se_pausado();
-        verificar_abort();
-        if (s_abort)
+        bool pausa_atual = obter_pausa();
+        /* Detecta mudança no status de pausa (a flag é alterada por outra task) */
+        if (pausa_atual != pausado)
         {
-            ESP_LOGW(TAG, "ABORT durante bater! Desligando motor.");
-            parar_motor_seguro();
-            ESP_LOGI(TAG, "<<< bater abortado");
-            return;
+            pausado = pausa_atual;
+
+            if (pausado)
+            {
+                gpio_set_level(GPIO_SSR_MESTRE, 0);
+                gpio_set_level(GPIO_MOTOR_HORARIO, 0);
+                gpio_set_level(GPIO_MOTOR_ANTI_H, 0);
+                ESP_LOGI(TAG, "PAUSA: bater desligado");
+            }
+            else
+            {
+                sentido_horario = !sentido_horario;
+                ESP_LOGI(TAG, "CONTINUAR: bater religado");
+            }
         }
 
-        if (tampa_aberta())
+        if (pausado == false)
         {
-            ESP_LOGW(TAG, "Tampa aberta durante batimento! Desligando motor.");
-            parar_motor_seguro();
-            led_pausa(true);
-            ESP_LOGI(TAG, "<<< bater abortado por seguranca");
-            return;
+            vTaskDelay(pdMS_TO_TICKS(100));
+            decorrido_ms += 100;
+            ms_no_sentido += 100;
+
+            if (ms_no_sentido >= BATIDA_TEMPO_SENTIDO_MS && decorrido_ms < tempo_total_ms)
+            {
+                gpio_set_level(GPIO_SSR_MESTRE, 0);
+                vTaskDelay(pdMS_TO_TICKS(BATIDA_TEMPO_PARADA_MS));
+
+                sentido_horario = !sentido_horario;
+                gpio_set_level(GPIO_MOTOR_HORARIO, sentido_horario ? 1 : 0);
+                gpio_set_level(GPIO_MOTOR_ANTI_H, sentido_horario ? 0 : 1);
+                vTaskDelay(pdMS_TO_TICKS(BATIDA_TEMPO_DEBOUNCE_RELE_MS));
+
+                gpio_set_level(GPIO_SSR_MESTRE, 1);
+                ms_no_sentido = 0;
+                decorrido_ms += (BATIDA_TEMPO_PARADA_MS + BATIDA_TEMPO_DEBOUNCE_RELE_MS);
+            }
         }
-
-        vTaskDelay(pdMS_TO_TICKS(100));
-        decorrido_ms += 100;
-        ms_no_sentido += 100;
-
-        /* Verifica se é hora de inverter o sentido */
-        if (ms_no_sentido >= BATIDA_TEMPO_SENTIDO_MS && decorrido_ms < tempo_total_ms)
+        else
         {
-            /* Para o motor, inverte relés e religa */
-            gpio_set_level(GPIO_SSR_MESTRE, 0);
-            vTaskDelay(pdMS_TO_TICKS(BATIDA_TEMPO_PARADA_MS));
-
-            sentido_horario = !sentido_horario;
-            gpio_set_level(GPIO_MOTOR_HORARIO, sentido_horario ? 1 : 0);
-            gpio_set_level(GPIO_MOTOR_ANTI_H, sentido_horario ? 0 : 1);
-            vTaskDelay(pdMS_TO_TICKS(BATIDA_TEMPO_DEBOUNCE_RELE_MS));
-
-            gpio_set_level(GPIO_SSR_MESTRE, 1);
-            ms_no_sentido = 0;
-            decorrido_ms += (BATIDA_TEMPO_PARADA_MS + BATIDA_TEMPO_DEBOUNCE_RELE_MS);
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
 
-    parar_motor_seguro();
+    gpio_set_level(GPIO_SSR_MESTRE, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    gpio_set_level(GPIO_MOTOR_HORARIO, 0);
+    gpio_set_level(GPIO_MOTOR_ANTI_H, 0);
+
     ESP_LOGI(TAG, "<<< bater concluido");
 }
 
@@ -806,110 +727,60 @@ void centrifugar(uint32_t tempo_sec)
 {
     ESP_LOGI(TAG, ">>> centrifugar(tempo=%" PRIu32 " s)", tempo_sec);
 
-    /* Verificações de segurança antes de começar */
-    if (tampa_aberta())
-    {
-        ESP_LOGW(TAG, "Tampa aberta! Nao e possivel centrifugar.");
-        led_pausa(true);
-        return;
-    }
-
     if (ler_tensao_adc() > (LIMIAR_TANQUE_VAZIO_MV + HISTERESE_NIVEL_MV))
     {
         ESP_LOGW(TAG, "Tanque com agua! Esvazie antes de centrifugar.");
-        led_pausa(true);
+        pausar();
         return;
     }
 
     if (desbalanceamento_detectado())
     {
         ESP_LOGW(TAG, "Desbalanceamento detectado! Nao e possivel centrifugar.");
-        led_pausa(true);
+        pausar();
         return;
     }
 
-    /* Sequência segura de partida: relé → delay → SSR */
     gpio_set_level(GPIO_SSR_MESTRE, 0);
     gpio_set_level(GPIO_MOTOR_HORARIO, 1);
     gpio_set_level(GPIO_MOTOR_ANTI_H, 0);
 
-    /* Aguarda contatos estabilizarem, verificando tampa/abort/desbalanceamento */
     for (int i = 0; i < 10; i++)
     {
         vTaskDelay(pdMS_TO_TICKS(10));
-
-        if (tampa_aberta())
-        {
-            ESP_LOGW(TAG, "Tampa aberta durante partida da centrifugacao!");
-            parar_motor_seguro();
-            led_pausa(true);
-            ESP_LOGI(TAG, "<<< centrifugar abortado por seguranca");
-            return;
-        }
 
         if (desbalanceamento_detectado())
         {
             ESP_LOGW(TAG, "Desbalanceamento durante partida da centrifugacao!");
             parar_motor_seguro();
-            led_pausa(true);
+            pausar();
             ESP_LOGI(TAG, "<<< centrifugar abortado por desbalanceamento");
-            return;
-        }
-
-        verificar_abort();
-        if (s_abort)
-        {
-            ESP_LOGW(TAG, "ABORT durante partida da centrifugacao!");
-            parar_motor_seguro();
-            ESP_LOGI(TAG, "<<< centrifugar abortado");
             return;
         }
     }
 
     gpio_set_level(GPIO_SSR_MESTRE, 1);
 
-    /* Monitora durante a centrifugação */
     uint32_t tempo_decorrido_ms = 0;
     uint32_t tempo_total_ms = tempo_sec * 1000;
     while (tempo_decorrido_ms < tempo_total_ms)
     {
-        aguardar_se_pausado();
+
         vTaskDelay(pdMS_TO_TICKS(100));
         tempo_decorrido_ms += 100;
-
-        if (tampa_aberta())
-        {
-            ESP_LOGW(TAG, "Tampa aberta durante centrifugacao! Parando motor.");
-            parar_motor_seguro();
-            led_pausa(true);
-            ESP_LOGI(TAG, "<<< centrifugar abortado por seguranca");
-            return;
-        }
 
         if (desbalanceamento_detectado())
         {
             ESP_LOGW(TAG, "Desbalanceamento durante centrifugacao! Parando motor.");
             parar_motor_seguro();
-            led_pausa(true);
+            pausar();
             ESP_LOGI(TAG, "<<< centrifugar abortado por desbalanceamento");
-            return;
-        }
-
-        verificar_abort();
-        if (s_abort)
-        {
-            ESP_LOGW(TAG, "ABORT durante centrifugacao! Parando motor.");
-            parar_motor_seguro();
-            ESP_LOGI(TAG, "<<< centrifugar abortado");
             return;
         }
     }
 
     parar_motor_seguro();
-
-    /* Aguarda o cesto desacelerar */
     vTaskDelay(pdMS_TO_TICKS(2000));
-
     ESP_LOGI(TAG, "<<< centrifugar concluido");
 }
 
@@ -918,7 +789,7 @@ void esvaziar(void)
     ESP_LOGI(TAG, ">>> esvaziar()");
 
     bool estado_vazio = false;
-    const uint32_t TIMEOUT_MS = 5 * 60 * 1000; /* 5 minutos */
+    const uint32_t TIMEOUT_MS = 5 * 60 * 1000;
     const uint32_t TICK_TIMEOUT = pdMS_TO_TICKS(TIMEOUT_MS);
     TickType_t inicio = xTaskGetTickCount();
 
@@ -928,29 +799,19 @@ void esvaziar(void)
 
     while (1)
     {
-        aguardar_se_pausado();
+
         uint32_t tensao = ler_tensao_adc();
 
-        /* Verifica se já está vazio usando histerese */
         if (tanque_vazio_com_histerese(&estado_vazio))
         {
             ESP_LOGI(TAG, "Tanque vazio detectado: %" PRIu32 " mV", tensao);
             break;
         }
 
-        /* Verifica timeout de segurança */
         if ((xTaskGetTickCount() - inicio) >= TICK_TIMEOUT)
         {
             ESP_LOGW(TAG, "Timeout de %" PRIu32 " ms atingido (ultima leitura: %" PRIu32 " mV)", TIMEOUT_MS, tensao);
-            led_pausa(true);
-            break;
-        }
-
-        /* Verifica abort solicitado pelo botão */
-        verificar_abort();
-        if (s_abort)
-        {
-            ESP_LOGW(TAG, "ABORT durante esvaziar!");
+            pausar();
             break;
         }
 
@@ -959,8 +820,19 @@ void esvaziar(void)
 
     gpio_set_level(GPIO_BOMBA_DREENO, 0);
     vTaskDelay(pdMS_TO_TICKS(500));
-
     ESP_LOGI(TAG, "<<< esvaziar concluido");
+}
+
+void abrir_valvula_dreno(void)
+{
+    ESP_LOGI(TAG, ">>> abrir_valvula_dreno()");
+    gpio_set_level(GPIO_BOMBA_DREENO, 1);
+}
+
+void fechar_valvula_dreno(void)
+{
+    ESP_LOGI(TAG, ">>> fechar_valvula_dreno()");
+    gpio_set_level(GPIO_BOMBA_DREENO, 0);
 }
 
 void led_ciclo_rodando(bool ligar)
