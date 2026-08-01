@@ -304,8 +304,6 @@ void app_main(void)
     /* Initialize preset function GPIOs */
     configurar_gpios_preset();
 
-    uint32_t last_print_tick = 0;
-
     /* Cria tasks monitoras (em paralelo, sempre rodando) */
     xTaskCreate(task_tampa_aberta, "tampa_aberta", 2048, NULL, 6, NULL);
     xTaskCreate(task_iniciar_abortar, "iniciar_abortar", 2048, NULL, 5, NULL);
