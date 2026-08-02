@@ -729,57 +729,107 @@ void centrifugar(uint32_t tempo_sec)
 
     if (ler_tensao_adc() > (LIMIAR_TANQUE_VAZIO_MV + HISTERESE_NIVEL_MV))
     {
-        ESP_LOGW(TAG, "Tanque com agua! Esvazie antes de centrifugar.");
-        pausar();
-        return;
-    }
-
-    if (desbalanceamento_detectado())
-    {
-        ESP_LOGW(TAG, "Desbalanceamento detectado! Nao e possivel centrifugar.");
-        pausar();
+        ESP_LOGW(TAG, "Erro: Tanque com agua, será necessario abortar o ciclo manualmente.");
         return;
     }
 
     gpio_set_level(GPIO_SSR_MESTRE, 0);
+
     gpio_set_level(GPIO_MOTOR_HORARIO, 1);
     gpio_set_level(GPIO_MOTOR_ANTI_H, 0);
-
-    for (int i = 0; i < 10; i++)
-    {
-        vTaskDelay(pdMS_TO_TICKS(10));
-
-        if (desbalanceamento_detectado())
-        {
-            ESP_LOGW(TAG, "Desbalanceamento durante partida da centrifugacao!");
-            parar_motor_seguro();
-            pausar();
-            ESP_LOGI(TAG, "<<< centrifugar abortado por desbalanceamento");
-            return;
-        }
-    }
 
     gpio_set_level(GPIO_SSR_MESTRE, 1);
 
     uint32_t tempo_decorrido_ms = 0;
     uint32_t tempo_total_ms = tempo_sec * 1000;
+
+    bool pausado = false;
+    bool bomba_dreno_ligada = false;
+    bool estado_vazio = false;
+
     while (tempo_decorrido_ms < tempo_total_ms)
     {
 
-        vTaskDelay(pdMS_TO_TICKS(100));
-        tempo_decorrido_ms += 100;
-
-        if (desbalanceamento_detectado())
+        bool pausa_atual = obter_pausa();
+        /* Detecta mudança no status de pausa (a flag é alterada por outra task) */
+        if (pausa_atual != pausado)
         {
-            ESP_LOGW(TAG, "Desbalanceamento durante centrifugacao! Parando motor.");
-            parar_motor_seguro();
-            pausar();
-            ESP_LOGI(TAG, "<<< centrifugar abortado por desbalanceamento");
-            return;
+            pausado = pausa_atual;
+
+            if (pausado)
+            {
+                gpio_set_level(GPIO_SSR_MESTRE, 0);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                gpio_set_level(GPIO_MOTOR_HORARIO, 0);
+                gpio_set_level(GPIO_MOTOR_ANTI_H, 0);
+                vTaskDelay(pdMS_TO_TICKS(2000));
+
+                if (bomba_dreno_ligada)
+                {
+                    gpio_set_level(GPIO_BOMBA_DREENO, 0);
+                    bomba_dreno_ligada = false;
+                    ESP_LOGI(TAG, "PAUSA: bomba de dreno desligada");
+                }
+
+                ESP_LOGI(TAG, "PAUSA: centrifugação desligado");
+            }
+            else
+            {
+                gpio_set_level(GPIO_MOTOR_HORARIO, 1);
+                gpio_set_level(GPIO_MOTOR_ANTI_H, 0);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                gpio_set_level(GPIO_SSR_MESTRE, 1);
+                ESP_LOGI(TAG, "CONTINUAR: centrifugação religado");
+            }
+        }
+
+        if (pausado == false)
+        {
+
+            vTaskDelay(pdMS_TO_TICKS(100));
+            tempo_decorrido_ms += 100;
+
+            /* Monitora a água solta pela roupa durante a centrifugação.
+             * Se o tanque acumular água, liga a bomba de drenagem para
+             * esvaziar enquanto o motor continua girando. */
+            if (!tanque_vazio_com_histerese(&estado_vazio) && !bomba_dreno_ligada)
+            {
+                ESP_LOGW(TAG, "Roupa soltando muita agua: ligando bomba de dreno");
+                gpio_set_level(GPIO_BOMBA_DREENO, 1);
+                bomba_dreno_ligada = true;
+            }
+            else if (tanque_vazio_com_histerese(&estado_vazio) && bomba_dreno_ligada)
+            {
+                ESP_LOGI(TAG, "Tanque vazio novamente: desligando bomba de dreno");
+                gpio_set_level(GPIO_BOMBA_DREENO, 0);
+                bomba_dreno_ligada = false;
+            }
+
+            if (desbalanceamento_detectado())
+            {
+                ESP_LOGW(TAG, "Desbalanceamento durante centrifugacao! Pausando ciclo.");
+                pausar();
+            }
+        }
+        else
+        {
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
 
-    parar_motor_seguro();
+    gpio_set_level(GPIO_SSR_MESTRE, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    gpio_set_level(GPIO_MOTOR_HORARIO, 0);
+    gpio_set_level(GPIO_MOTOR_ANTI_H, 0);
+
+    /* Garante que a bomba de dreno seja desligada no final */
+    if (bomba_dreno_ligada)
+    {
+        gpio_set_level(GPIO_BOMBA_DREENO, 0);
+        bomba_dreno_ligada = false;
+        ESP_LOGI(TAG, "Fim: bomba de dreno desligada");
+    }
+
     vTaskDelay(pdMS_TO_TICKS(2000));
     ESP_LOGI(TAG, "<<< centrifugar concluido");
 }
@@ -789,9 +839,6 @@ void esvaziar(void)
     ESP_LOGI(TAG, ">>> esvaziar()");
 
     bool estado_vazio = false;
-    const uint32_t TIMEOUT_MS = 5 * 60 * 1000;
-    const uint32_t TICK_TIMEOUT = pdMS_TO_TICKS(TIMEOUT_MS);
-    TickType_t inicio = xTaskGetTickCount();
 
     ESP_LOGI(TAG, "Limiar de vazio: %" PRIu32 " mV", (uint32_t)LIMIAR_TANQUE_VAZIO_MV);
 
@@ -805,13 +852,6 @@ void esvaziar(void)
         if (tanque_vazio_com_histerese(&estado_vazio))
         {
             ESP_LOGI(TAG, "Tanque vazio detectado: %" PRIu32 " mV", tensao);
-            break;
-        }
-
-        if ((xTaskGetTickCount() - inicio) >= TICK_TIMEOUT)
-        {
-            ESP_LOGW(TAG, "Timeout de %" PRIu32 " ms atingido (ultima leitura: %" PRIu32 " mV)", TIMEOUT_MS, tensao);
-            pausar();
             break;
         }
 
